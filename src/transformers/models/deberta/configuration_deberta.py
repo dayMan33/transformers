@@ -114,6 +114,11 @@ class DebertaConfig(PretrainedConfig):
         pos_att_type=None,
         pooler_dropout=0,
         pooler_hidden_act="gelu",
+        exit_layers=None,
+        freeze_previous_layers=False,
+        probe_model=False,
+        gold_exit_layer = None,
+        exit_thresholds=1,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -144,6 +149,13 @@ class DebertaConfig(PretrainedConfig):
         self.pooler_hidden_size = kwargs.get("pooler_hidden_size", hidden_size)
         self.pooler_dropout = pooler_dropout
         self.pooler_hidden_act = pooler_hidden_act
+        self.exit_layers = [num_hidden_layers] if exit_layers is None else exit_layers
+        self.freeze_previous_layers = freeze_previous_layers
+        self.probe_model = probe_model
+        self.gold_exit_layer = gold_exit_layer
+        self.exit_thresholds = exit_thresholds
+        self.loss_fct = None
+        self.loss_kwargs = None
 
 
 # Copied from transformers.models.deberta_v2.configuration_deberta_v2.DebertaV2OnnxConfig

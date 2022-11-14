@@ -22,6 +22,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from ...utils.losses import  LOSS_MAP
 
 from ...activations import ACT2FN
 from ...modeling_outputs import (
@@ -413,6 +414,8 @@ class DebertaEncoder(nn.Module):
         query_states=None,
         relative_pos=None,
         return_dict=True,
+        start_idx: int = 0,
+        exit_idx: int = -1,
     ):
         attention_mask = self.get_attention_mask(attention_mask)
         relative_pos = self.get_rel_pos(hidden_states, query_states, relative_pos)
@@ -425,7 +428,9 @@ class DebertaEncoder(nn.Module):
         else:
             next_kv = hidden_states
         rel_embeddings = self.get_rel_embedding()
-        for i, layer_module in enumerate(self.layer):
+        if exit_idx == -1:
+            exit_idx = len(self.layer)
+        for i, layer_module in enumerate(self.layer[start_idx: exit_idx + 1], start=start_idx):
 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -923,6 +928,9 @@ class DebertaModel(DebertaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        last_hidden_state=None,
+        start_idx: int = 0,
+        exit_idx: int = -1,
     ) -> Union[Tuple, BaseModelOutput]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -945,21 +953,25 @@ class DebertaModel(DebertaPreTrainedModel):
             attention_mask = torch.ones(input_shape, device=device)
         if token_type_ids is None:
             token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
-
-        embedding_output = self.embeddings(
-            input_ids=input_ids,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            mask=attention_mask,
-            inputs_embeds=inputs_embeds,
-        )
+        if last_hidden_state is not None:
+            encoder_input = last_hidden_state
+        else:
+            encoder_input = self.embeddings(
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+            )
 
         encoder_outputs = self.encoder(
-            embedding_output,
+            encoder_input,
             attention_mask,
             output_hidden_states=True,
             output_attentions=output_attentions,
             return_dict=return_dict,
+            start_idx=start_idx,
+            exit_idx=exit_idx,
         )
         encoded_layers = encoder_outputs[1]
 
@@ -969,7 +981,7 @@ class DebertaModel(DebertaPreTrainedModel):
             query_states = encoded_layers[-1]
             rel_embeddings = self.encoder.get_rel_embedding()
             attention_mask = self.encoder.get_attention_mask(attention_mask)
-            rel_pos = self.encoder.get_rel_pos(embedding_output)
+            rel_pos = self.encoder.get_rel_pos(encoder_input)
             for layer in layers[1:]:
                 query_states = layer(
                     hidden_states,
@@ -1135,24 +1147,57 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
 
         num_labels = getattr(config, "num_labels", 2)
         self.num_labels = num_labels
-
+        # TODO: adjust DebertaModel
         self.deberta = DebertaModel(config)
         self.pooler = ContextPooler(config)
         output_dim = self.pooler.output_dim
 
-        self.classifier = nn.Linear(output_dim, num_labels)
+        self.exit_layers = config.exit_layers
+        self.freeze_previous_layers = config.freeze_previous_layers
+        self.probe_model = config.probe_model
+        if config.exit_layers is None:
+            self.exit_layers = [len(self.bert.encoder.layer) -1]
+        num_exit_layers = len(self.exit_layers)
+        self.gold_exit_layer = config.gold_exit_layer
+        if self.gold_exit_layer is not None:
+            if self.gold_exit_layer not in self.exit_layers:
+                raise ValueError('gold exit layer must be an existing exit layer within the model')
+        self.classifiers = nn.ModuleList([nn.Linear(output_dim, num_labels) for _ in range(num_exit_layers)])
         drop_out = getattr(config, "cls_dropout", None)
         drop_out = self.config.hidden_dropout_prob if drop_out is None else drop_out
         self.dropout = StableDropout(drop_out)
 
         # Initialize weights and apply final processing
         self.post_init()
+        self.exit_thresholds = config.exit_thresholds
+        self.exit_threshold = self.exit_thresholds[0]
+        self.loss_fct: str = config.loss_fct
+        self.loss_kwargs: tuple = config.loss_kwargs
+        self.scaling_temperatures = [1. for _ in self.exit_layers]
 
     def get_input_embeddings(self):
         return self.deberta.get_input_embeddings()
 
     def set_input_embeddings(self, new_embeddings):
         self.deberta.set_input_embeddings(new_embeddings)
+
+    def set_exit_threshold(self, thr):
+        if thr < 1 / self.num_labels or thr > 1:
+            raise ValueError(f'model exit threshold should be >= (1/ num of labels) and <= 1. This does not hold for '
+                             f'the supplied threshold {thr}')
+        self.exit_threshold = thr
+
+    def set_scaling_temperatures(self, temps, indices = None):
+        if len(temps) == len(self.exit_layers):
+            self.scaling_temperatures = [float(t) for t in temps]
+        elif indices is not None:
+            for i, idx in enumerate(indices):
+                self.scaling_temperatures[idx] = float(temps[i])
+        else:
+            raise ValueError('there must be as many temps as there are exit layers, or indices must be specified')
+
+
+
 
     @add_start_docstrings_to_model_forward(DEBERTA_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
@@ -1172,6 +1217,7 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        exit_threshold = None,
     ) -> Union[Tuple, SequenceClassifierOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -1180,55 +1226,90 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        hidden_state = None
+        device = labels.device
+        exit_layer_logits = torch.zeros((len(self.exit_layers), labels.shape[0], self.num_labels), device = device)
+        for i, exit_layer in enumerate(self.exit_layers):
+            if i == 0:
+                start_idx = 0
+            else:
+                start_idx = self.exit_layers[i - 1] + 1
 
-        outputs = self.deberta(
-            input_ids,
-            token_type_ids=token_type_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
+            outputs = self.deberta(
+                input_ids,
+                token_type_ids=token_type_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                start_idx=start_idx,
+                exit_idx=exit_layer,
+                last_hidden_state=hidden_state
+            )
 
-        encoder_layer = outputs[0]
-        pooled_output = self.pooler(encoder_layer)
-        pooled_output = self.dropout(pooled_output)
-        logits = self.classifier(pooled_output)
+            encoder_layer = outputs[0]
+            pooled_output = self.pooler(encoder_layer)
+            pooled_output = self.dropout(pooled_output)
+            hidden_state = outputs.last_hidden_state
+            if self.freeze_previous_layers:
+                hidden_state = hidden_state.detach()
+            elif i != (len(self.exit_layers) - 1) and self.probe_model:
+                pooled_output = pooled_output.detach()
+            logits = self.classifiers[i](pooled_output).view(-1, self.num_labels) / self.scaling_temperatures[i]
+            exit_layer_logits[i,...] = logits
 
+            # early exit strategy
+            if not self.training:
+                assert (logits.shape[0] == 1)  # make sure we are running inference with batch of size 1
+                if self.gold_exit_layer is not None:
+                    if exit_layer == self.gold_exit_layer:
+                        break
+                else:
+                    probs = torch.softmax(logits, dim=-1)
+                    if torch.max(probs, dim=1)[0] >= self.exit_threshold:
+                        break
         loss = None
         if labels is not None:
             if self.config.problem_type is None:
                 if self.num_labels == 1:
-                    # regression task
-                    loss_fn = nn.MSELoss()
-                    logits = logits.view(-1).to(labels.dtype)
-                    loss = loss_fn(logits, labels.view(-1))
-                elif labels.dim() == 1 or labels.size(-1) == 1:
-                    label_index = (labels >= 0).nonzero()
-                    labels = labels.long()
-                    if label_index.size(0) > 0:
-                        labeled_logits = torch.gather(
-                            logits, 0, label_index.expand(label_index.size(0), logits.size(1))
-                        )
-                        labels = torch.gather(labels, 0, label_index.view(-1))
-                        loss_fct = CrossEntropyLoss()
-                        loss = loss_fct(labeled_logits.view(-1, self.num_labels).float(), labels.view(-1))
-                    else:
-                        loss = torch.tensor(0).to(logits)
+                    self.config.problem_type = "regression"
+                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+                    self.config.problem_type = "single_label_classification"
                 else:
-                    log_softmax = nn.LogSoftmax(-1)
-                    loss = -((log_softmax(logits) * labels).sum(-1)).mean()
-            elif self.config.problem_type == "regression":
+                    self.config.problem_type = "multi_label_classification"
+                # if self.num_labels == 1:
+                #     # regression task
+                #     loss_fn = nn.MSELoss()
+                #     logits = logits.view(-1).to(labels.dtype)
+                #     loss = loss_fn(logits, labels.view(-1))
+                # elif labels.dim() == 1 or labels.size(-1) == 1:
+                #     label_index = (labels >= 0).nonzero()
+                #     labels = labels.long()
+                #     if label_index.size(0) > 0:
+                #         labeled_logits = torch.gather(
+                #             logits, 0, label_index.expand(label_index.size(0), logits.size(1))
+                #         )
+                #         labels = torch.gather(labels, 0, label_index.view(-1))
+                #         loss_fct = CrossEntropyLoss()
+                #         loss = loss_fct(labeled_logits.view(-1, self.num_labels).float(), labels.view(-1))
+                #     else:
+                #         loss = torch.tensor(0).to(logits)
+                # else:
+                #     log_softmax = nn.LogSoftmax(-1)
+                #     loss = -((log_softmax(logits) * labels).sum(-1)).mean()
+            if self.config.problem_type == "regression":
                 loss_fct = MSELoss()
                 if self.num_labels == 1:
                     loss = loss_fct(logits.squeeze(), labels.squeeze())
                 else:
                     loss = loss_fct(logits, labels)
             elif self.config.problem_type == "single_label_classification":
-                loss_fct = CrossEntropyLoss()
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+                labels = labels.view(-1)
+                loss_fct = LOSS_MAP[self.loss_fct](**self.loss_kwargs)
+                loss = loss_fct(exit_layer_logits, labels)
+
             elif self.config.problem_type == "multi_label_classification":
                 loss_fct = BCEWithLogitsLoss()
                 loss = loss_fct(logits, labels)
@@ -1237,7 +1318,7 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
             return ((loss,) + output) if loss is not None else output
 
         return SequenceClassifierOutput(
-            loss=loss, logits=logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions
+            loss=loss, logits=exit_layer_logits.squeeze(1).unsqueeze(0), hidden_states=outputs.hidden_states, attentions=outputs.attentions
         )
 
 

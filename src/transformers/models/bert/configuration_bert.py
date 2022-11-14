@@ -154,6 +154,11 @@ class BertConfig(PretrainedConfig):
         position_embedding_type="absolute",
         use_cache=True,
         classifier_dropout=None,
+        exit_layers=None,
+        freeze_previous_layers=False,
+        probe_model=False,
+        gold_exit_layer = None,
+        exit_thresholds=1,
         **kwargs
     ):
         super().__init__(pad_token_id=pad_token_id, **kwargs)
@@ -173,6 +178,17 @@ class BertConfig(PretrainedConfig):
         self.position_embedding_type = position_embedding_type
         self.use_cache = use_cache
         self.classifier_dropout = classifier_dropout
+        self.exit_layers = [num_hidden_layers] if exit_layers is None else exit_layers
+        self.freeze_previous_layers = freeze_previous_layers
+        self.probe_model = probe_model
+        self.gold_exit_layer = gold_exit_layer
+        self.exit_thresholds = exit_thresholds
+        self.loss_fct = None
+        self.exit_strategy = None
+        self.exit_kwargs = None
+        self.loss_kwargs = None
+
+
 
 
 class BertOnnxConfig(OnnxConfig):
