@@ -23,6 +23,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from ...utils.losses import  LOSS_MAP
+from ...utils.exit_strategies import EXIT_MAP
 
 from ...activations import ACT2FN
 from ...modeling_outputs import (
@@ -1154,7 +1155,6 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
 
         self.exit_layers = config.exit_layers
         self.freeze_previous_layers = config.freeze_previous_layers
-        self.probe_model = config.probe_model
         if config.exit_layers is None:
             self.exit_layers = [len(self.bert.encoder.layer) -1]
         num_exit_layers = len(self.exit_layers)
@@ -1172,6 +1172,7 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
         self.exit_thresholds = config.exit_thresholds
         self.exit_threshold = self.exit_thresholds[0]
         self.loss_fct: str = config.loss_fct
+        self.set_exit_strategy(config.exit_strategy, **config.exit_kwargs)
         self.loss_kwargs: tuple = config.loss_kwargs
         self.scaling_temperatures = [1. for _ in self.exit_layers]
 
@@ -1195,6 +1196,9 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
                 self.scaling_temperatures[idx] = float(temps[i])
         else:
             raise ValueError('there must be as many temps as there are exit layers, or indices must be specified')
+
+    def set_exit_strategy(self, strategy, **kwargs):
+        self.exit_strategy = EXIT_MAP[strategy](**kwargs)
 
 
 
@@ -1255,8 +1259,6 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
             hidden_state = outputs.last_hidden_state
             if self.freeze_previous_layers:
                 hidden_state = hidden_state.detach()
-            elif i != (len(self.exit_layers) - 1) and self.probe_model:
-                pooled_output = pooled_output.detach()
             logits = self.classifiers[i](pooled_output).view(-1, self.num_labels) / self.scaling_temperatures[i]
             exit_layer_logits[i,...] = logits
 
@@ -1266,10 +1268,9 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
                 if self.gold_exit_layer is not None:
                     if exit_layer == self.gold_exit_layer:
                         break
-                else:
-                    probs = torch.softmax(logits, dim=-1)
-                    if torch.max(probs, dim=1)[0] >= self.exit_threshold:
-                        break
+                elif self.exit_strategy(logits):
+                    break
+
         loss = None
         if labels is not None:
             if self.config.problem_type is None:

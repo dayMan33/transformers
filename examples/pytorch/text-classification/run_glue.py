@@ -147,11 +147,11 @@ class DataTrainingArguments:
         default=False,
         metadata={"help": "A boolean flag indicating whether the model should be calibrated prior to evaluation"}
     )
-    # do_not_save_model: Optional[bool] = field(
-    #     default=False,
-    #     metadata={
-    #         "help": "A boolean flag indicating whether the model should not be saved after evaluation to save space"}
-    # )
+    eval_seperate_layers: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "A boolean flag indicating whether the model should not be saved after evaluation to save space"}
+    )
     test_file: Optional[str] = field(default=None, metadata={"help": "A csv or a json file containing the test data."})
 
     def __post_init__(self):

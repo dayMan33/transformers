@@ -155,6 +155,8 @@ class DebertaConfig(PretrainedConfig):
         self.gold_exit_layer = gold_exit_layer
         self.exit_thresholds = exit_thresholds
         self.loss_fct = None
+        self.exit_strategy = None
+        self.exit_kwargs = None
         self.loss_kwargs = None
 
 

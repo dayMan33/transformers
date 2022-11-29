@@ -1736,14 +1736,13 @@ class BertForSequenceClassification(BertPreTrainedModel):
             if self.freeze_previous_layers:
                 hidden_state = hidden_state.detach()
             logits = self.classifiers[i](pooled_output).view(-1, self.num_labels) / self.scaling_temperatures[i]
-
-            exit_layer_logits[i, ...] = logits
-            if self.gold_exit_layer is not None:
-                if exit_layer == self.gold_exit_layer:
-                    exit_layer_logits = logits.unsqueeze(0)
-                    break
-            elif not self.training:
-                if self.exit_strategy(logits):
+            if not self.training:
+                exit_layer_logits[i, ...] = logits
+                if self.gold_exit_layer is not None:
+                    if exit_layer == self.gold_exit_layer:
+                        exit_layer_logits = logits.unsqueeze(0)
+                        break
+                elif self.exit_strategy(logits):
                     break
 
 

@@ -1196,7 +1196,7 @@ class RobertaForSequenceClassification(RobertaPreTrainedModel):
         # self.exit_thresholds = config.exit_thresholds
         # self.exit_threshold = self.exit_thresholds[0]
         self.loss_fct: str = config.loss_fct
-        self.exit_strategy: str = config.exit_strategy
+        # self.exit_strategy: str = config.exit_strategy
         self.set_exit_strategy(config.exit_strategy, **config.exit_kwargs)
         self.loss_kwargs: tuple = config.loss_kwargs
         self.scaling_temperatures = [1. for _ in self.exit_layers]
@@ -1271,10 +1271,9 @@ class RobertaForSequenceClassification(RobertaPreTrainedModel):
                 exit_idx=exit_layer,
                 last_hidden_state=hidden_state,
             )
-            sequence_output = outputs[0]
-            hidden_state = sequence_output
+            sequence_output = outputs.last_hidden_state
             if self.freeze_previous_layers:
-                hidden_state = hidden_state.detach()
+                hidden_state = outputs.last_hidden_state.detach()
             logits = self.classifiers[i](sequence_output).view(-1, self.num_labels) / self.scaling_temperatures[i]
             exit_layer_logits[i, ...] = logits
             if self.gold_exit_layer is not None:
@@ -1306,8 +1305,9 @@ class RobertaForSequenceClassification(RobertaPreTrainedModel):
                 else:
                     loss = loss_fct(logits, labels)
             elif self.config.problem_type == "single_label_classification":
+                labels = labels.view(-1)
                 loss_fct = LOSS_MAP[self.loss_fct](**self.loss_kwargs)
-                loss = loss_fct(exit_layer_logits, labels.view(-1))
+                loss = loss_fct(exit_layer_logits, labels)
             elif self.config.problem_type == "multi_label_classification":
                 loss_fct = BCEWithLogitsLoss()
                 loss = loss_fct(logits, labels)
