@@ -634,7 +634,10 @@ def main():
     base_output_dir = training_args.output_dir
     for model, config in zip(models, configs):
         if exit_layers is not None:
-            training_args.output_dir = path.join(base_output_dir,
+            if model_args.multi_bert_model:
+                training_args.output_dir = path.join(base_output_dir,f'{config.num_hidden_layers - 1}_layer_model')
+            else:
+                training_args.output_dir = path.join(base_output_dir,
                                                  '_'.join([str(layer) for layer in exit_layers] + ['blocks']))
         label_to_id = None
         if (model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
@@ -797,6 +800,7 @@ def main():
                         temp_file.write(str(t) + '\n')
             logger.info(f'Calibrated temperatures: {temps}')
             model.set_scaling_temperatures(temps)
+            model.set_scaling_temperatures(temps)
         model = model.to('cpu')
 
     # Evaluation
@@ -812,16 +816,13 @@ def main():
             tokenizer=tokenizer,
             data_collator=data_collator,
         )
+        eval_dataloader = trainer.get_eval_dataloader(eval_dataset)
+        total_metrics = {}
+        data_shape = eval_dataloader.dataset.shape[0]
         if model_args.multi_bert_model:
             for model in models:
                 model.eval()
             samples_seen = 0
-            eval_dataloader = trainer.get_eval_dataloader(eval_dataset)
-            total_metrics = {}
-            if data_args.dataset_name == 'sst':
-                data_shape = len(eval_dataloader.dataset.labels)
-            else:
-                data_shape = eval_dataloader.dataset.shape[0]
             for thr in exit_thresholds:
                 total_predictions = np.zeros((data_shape, len(models), num_labels))
                 label_ids = np.zeros((data_shape, 1))
@@ -831,12 +832,13 @@ def main():
 
                     for i, model in enumerate(models):
                         model = model.to(training_args.device)
+                        model.set_exit_strategy(model_args.exit_strategy, threshold = thr)
                         with torch.no_grad():
-                            outputs = model(**batch)
+                            outputs = model(**batch, output_hidden_states = True)
 
                         total_predictions[step, i, ...] = outputs.logits.squeeze().cpu()
-                        probs = outputs.logits.softmax(dim=-1).squeeze()
-                        if torch.max(probs) > thr:
+                        # probs = outputs.logits.softmax(dim=-1).squeeze()
+                        if model.exit_strategy(outputs.logits.squeeze(0)):
                             break
                         model.to('cpu')
                     batch = move_to_device(batch, 'cpu')
@@ -848,6 +850,30 @@ def main():
                 metrics_for_logging = {k: v for k, v in metrics.items() if 'layer' not in k}
                 trainer.log_metrics(f"eval_for_thr {thr}", metrics_for_logging)
             trainer.save_metrics(f"eval", total_metrics, combined=False)
+
+            layer_predictions = np.zeros((data_shape, len(models), num_labels))
+            for i, model in enumerate(models):
+                label_ids = np.zeros((data_shape, 1))
+                for step, batch in enumerate(eval_dataloader):
+                    label_ids[step, ...] = batch['labels'][0]
+                    batch = move_to_device(batch, training_args.device)
+                    model = model.to(training_args.device)
+                    with torch.no_grad():
+                        outputs = model(**batch)
+                    layer_predictions[step, i, ...] = outputs.logits.squeeze().cpu()
+                    probs = outputs.logits.softmax(dim=-1).squeeze()
+                    batch = move_to_device(batch, 'cpu')
+                model.to('cpu')
+                metrics = compute_multiexit_metrics(EvalPrediction(layer_predictions, label_ids), True)
+                new_metrics = {}
+                for key, value in metrics.items():
+                    if key.startswith('layer'):
+                        if int(key.split('_')[-1]) != exit_layers[i]:
+                            continue
+                    new_metrics [key] = value
+                trainer.save_metrics(f'layer_{exit_layers[i]}',new_metrics, combined=False)
+            print('ji')
+
 
         else:
             logger.info("*** Evaluate ***")
@@ -887,6 +913,31 @@ def main():
                     metrics_for_logging = {k: v for k, v in metrics.items() if 'layer' not in k}
                     trainer.log_metrics(f"eval_for_thr {thr}", metrics_for_logging)
                 trainer.save_metrics(f"eval", total_metrics, combined=False)
+            model = model.to(training_args.device)
+            label_ids = np.zeros((data_shape, 1))
+            layer_predictions = np.zeros((data_shape, len(exit_layers), num_labels))
+            for i, layer in enumerate(exit_layers):
+                model.set_gold_exit_layer(layer)
+                for step, batch in enumerate(eval_dataloader):
+                    label_ids[step, ...] = batch['labels'][0]
+                    batch = move_to_device(batch, training_args.device)
+
+                    with torch.no_grad():
+                        outputs = model(**batch)
+                    layer_predictions[step, i, ...] = outputs.logits.squeeze()[i].cpu()
+                    batch = move_to_device(batch, 'cpu')
+                metrics = compute_multiexit_metrics(EvalPrediction(layer_predictions, label_ids), True)
+                new_metrics = {}
+                for key, value in metrics.items():
+                    if key.startswith('layer'):
+                        if int(key.split('_')[-1]) != exit_layers[i]:
+                            continue
+                    new_metrics [key] = value
+                trainer.save_metrics(f'layer_{exit_layers[i]}',new_metrics, combined=False)
+            model.to('cpu')
+
+
+
 
     if training_args.do_predict:
         logger.info("*** Predict ***")

@@ -1158,10 +1158,8 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
         if config.exit_layers is None:
             self.exit_layers = [len(self.bert.encoder.layer) -1]
         num_exit_layers = len(self.exit_layers)
-        self.gold_exit_layer = config.gold_exit_layer
-        if self.gold_exit_layer is not None:
-            if self.gold_exit_layer not in self.exit_layers:
-                raise ValueError('gold exit layer must be an existing exit layer within the model')
+        self.gold_exit_layer = self.set_gold_exit_layer(config.gold_exit_layer)
+
         self.classifiers = nn.ModuleList([nn.Linear(output_dim, num_labels) for _ in range(num_exit_layers)])
         drop_out = getattr(config, "cls_dropout", None)
         drop_out = self.config.hidden_dropout_prob if drop_out is None else drop_out
@@ -1196,6 +1194,12 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
                 self.scaling_temperatures[idx] = float(temps[i])
         else:
             raise ValueError('there must be as many temps as there are exit layers, or indices must be specified')
+
+    def set_gold_exit_layer(self, layer):
+        if layer is not None:
+            if layer not in self.exit_layers:
+                raise ValueError('gold exit layer must be an existing exit layer within the model')
+        self.gold_exit_layer = layer
 
     def set_exit_strategy(self, strategy, **kwargs):
         self.exit_strategy = EXIT_MAP[strategy](**kwargs)
