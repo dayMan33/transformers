@@ -578,7 +578,7 @@ def main():
         return sum(counts_times_layers) / (sum(counts) * (exit_layers[-1] + 1))
 
     # TODO: create my own compute_metric function
-    def compute_multiexit_metrics(p: EvalPrediction, is_multi_model=False):
+    def compute_multiexit_metrics(p: EvalPrediction, is_multi_model=False, gold_layer=None):
         preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
         # preds = np.squeeze(preds) if is_regression else np.argmax(preds, axis=1)
 
@@ -592,7 +592,9 @@ def main():
         for i, prediction in enumerate(preds):
             layer_ind = 0
             for layer_logits in prediction[1:]:
-                if np.all(layer_logits == layer_logits[0]):
+                if np.all(layer_logits == layer_logits[0]) and gold_layer is None:
+                    break
+                elif gold_layer == exit_layers[layer_ind]:
                     break
                 else:
                     layer_ind += 1
@@ -789,7 +791,7 @@ def main():
         if data_args.do_calibration:
             calibration_dataset = eval_dataset
             temperature_file_path = path.join(training_args.output_dir, 'scaling_temperatures.txt')
-            if not model_args.multi_bert_model and path.exists(temperature_file_path):
+            if  path.exists(temperature_file_path):
                 with open(temperature_file_path, 'r') as temp_file:
                     temps = temp_file.readlines()
             else:
@@ -799,7 +801,6 @@ def main():
                     for t in temps:
                         temp_file.write(str(t) + '\n')
             logger.info(f'Calibrated temperatures: {temps}')
-            model.set_scaling_temperatures(temps)
             model.set_scaling_temperatures(temps)
         model = model.to('cpu')
 
@@ -825,23 +826,36 @@ def main():
             samples_seen = 0
             for thr in exit_thresholds:
                 total_predictions = np.zeros((data_shape, len(models), num_labels))
+                layer_predictions = np.zeros((data_shape, len(models), num_labels))
                 label_ids = np.zeros((data_shape, 1))
                 for step, batch in enumerate(eval_dataloader):
                     label_ids[step, ...] = batch['labels'][0]
                     batch = move_to_device(batch, training_args.device)
-
+                    exit_flag = False
                     for i, model in enumerate(models):
                         model = model.to(training_args.device)
                         model.set_exit_strategy(model_args.exit_strategy, threshold = thr)
                         with torch.no_grad():
                             outputs = model(**batch, output_hidden_states = True)
 
-                        total_predictions[step, i, ...] = outputs.logits.squeeze().cpu()
+                        layer_predictions[step, i, ...] = outputs.logits.squeeze().cpu()
+                        if not exit_flag:
+                            total_predictions[step, i, ...] = outputs.logits.squeeze().cpu()
                         # probs = outputs.logits.softmax(dim=-1).squeeze()
                         if model.exit_strategy(outputs.logits.squeeze(0)):
-                            break
+                            exit_flag = True
                         model.to('cpu')
                     batch = move_to_device(batch, 'cpu')
+                for j, layer in enumerate(exit_layers):
+                    separate_layer_metrics = compute_multiexit_metrics(EvalPrediction(layer_predictions, label_ids), False, layer)
+                    new_metrics = {}
+                    for key, value in separate_layer_metrics.items():
+                        if key.startswith('layer'):
+                            if int(key.split('_')[-1]) != exit_layers[j]:
+                                continue
+                        new_metrics [key] = value
+                    trainer.save_metrics(f'layer_{exit_layers[j]}', new_metrics, combined=False)
+
                 metrics = compute_multiexit_metrics(EvalPrediction(total_predictions, label_ids), True)
                 for key in list(metrics.keys()):
                     if not key.startswith("eval_"):
@@ -850,28 +864,6 @@ def main():
                 metrics_for_logging = {k: v for k, v in metrics.items() if 'layer' not in k}
                 trainer.log_metrics(f"eval_for_thr {thr}", metrics_for_logging)
             trainer.save_metrics(f"eval", total_metrics, combined=False)
-
-            layer_predictions = np.zeros((data_shape, len(models), num_labels))
-            for i, model in enumerate(models):
-                label_ids = np.zeros((data_shape, 1))
-                for step, batch in enumerate(eval_dataloader):
-                    label_ids[step, ...] = batch['labels'][0]
-                    batch = move_to_device(batch, training_args.device)
-                    model = model.to(training_args.device)
-                    with torch.no_grad():
-                        outputs = model(**batch)
-                    layer_predictions[step, i, ...] = outputs.logits.squeeze().cpu()
-                    probs = outputs.logits.softmax(dim=-1).squeeze()
-                    batch = move_to_device(batch, 'cpu')
-                model.to('cpu')
-                metrics = compute_multiexit_metrics(EvalPrediction(layer_predictions, label_ids), True)
-                new_metrics = {}
-                for key, value in metrics.items():
-                    if key.startswith('layer'):
-                        if int(key.split('_')[-1]) != exit_layers[i]:
-                            continue
-                    new_metrics [key] = value
-                trainer.save_metrics(f'layer_{exit_layers[i]}',new_metrics, combined=False)
             print('ji')
 
 
@@ -933,7 +925,7 @@ def main():
                         if int(key.split('_')[-1]) != exit_layers[i]:
                             continue
                     new_metrics [key] = value
-                trainer.save_metrics(f'layer_{exit_layers[i]}',new_metrics, combined=False)
+                trainer.save_metrics(f'layer_{exit_layers[i]}', new_metrics, combined=False)
             model.to('cpu')
 
 
